@@ -18,9 +18,8 @@ MODEL_PATH = 'mvit32-2.pt'
 MEAN = np.array([123.675, 116.28, 103.53])
 STD = np.array([58.395, 57.12, 57.375])
 
-# Количество кадров для модели и перекрытие
+# Количество кадров для модели
 NUM_FRAMES = 32
-OVERLAP = 16
 
 # Загрузка модели при запуске приложения
 print("Загрузка модели...")
@@ -35,7 +34,7 @@ else:
     device = torch.device('cpu')
     print("Используется CPU для вычислений.")
 
-def extract_frames(video_path):
+def extract_frames(video_path: str):
     cap = cv2.VideoCapture(video_path)
     frames = []
 
@@ -56,125 +55,102 @@ def resize_and_pad(image, size=(224, 224)):
 
     delta_w = size[1] - new_w
     delta_h = size[0] - new_h
-    top, bottom = delta_h//2, delta_h - (delta_h//2)
-    left, right = delta_w//2, delta_w - (delta_w//2)
+    top, bottom = delta_h // 2, delta_h - (delta_h // 2)
+    left, right = delta_w // 2, delta_w - (delta_w // 2)
 
     color = [114, 114, 114]
     new_image = cv2.copyMakeBorder(resized_image, top, bottom, left, right, cv2.BORDER_CONSTANT, value=color)
     return new_image
 
 def preprocess_frame(frame):
+    # Переводим BGR → RGB
     frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    # Изменяем размер и делаем паддинг
     frame = resize_and_pad(frame)
+    # Нормализация
     frame = (frame - MEAN) / STD
+    # Меняем оси: HWC -> CHW
     frame = np.transpose(frame, (2, 0, 1))
     return frame
 
-def process_video_segments(frames, model):
-    predictions = []
-    num_frames = len(frames)
-    start_idx = 0
-
-    while start_idx < num_frames:
-        end_idx = start_idx + NUM_FRAMES
-        if end_idx > num_frames:
-            end_idx = num_frames
-
-        segment_frames = frames[start_idx:end_idx]
-
-        if len(segment_frames) < NUM_FRAMES:
-            last_frame = segment_frames[-1]
-            while len(segment_frames) < NUM_FRAMES:
-                segment_frames.append(last_frame)
-
-        # Создаем входной тензор
-        input_tensor = np.stack(segment_frames, axis=0)  # [NUM_FRAMES, 3, 224, 224]
-        input_tensor = np.transpose(input_tensor, (1, 0, 2, 3))  # [3, NUM_FRAMES, 224, 224]
-        input_tensor = input_tensor[None, None, ...]  # [1, 1, 3, NUM_FRAMES, 224, 224]
-        input_tensor = torch.from_numpy(input_tensor.astype(np.float32))
-
-        input_tensor = input_tensor.to(device)
-
-        # Предсказание
-        with torch.no_grad():
-            outputs = model(input_tensor)
-            outputs = torch.nn.functional.softmax(outputs, dim=1)  # Получаем вероятности
-            outputs = outputs.cpu().numpy()
-            predicted_class_index = np.argmax(outputs, axis=1)[0]
-            predicted_class = classes[predicted_class_index]
-            predictions.append(predicted_class)
-            print(f"Сегмент с кадра {start_idx} по {end_idx}: {predicted_class}")
-
-        # Управление памятью
-        del input_tensor
-        del segment_frames
-        gc.collect()
-
-        # Обновляем индекс с учетом перекрытия
-        if end_idx == num_frames:
-            break  
-        start_idx += NUM_FRAMES - OVERLAP
-
-    return predictions
-
-def post_process_predictions(predictions):
-    processed = []
-    prev_pred = None
-    for pred in predictions:
-        if pred != prev_pred and pred != '---':
-            processed.append(pred)
-            prev_pred = pred
-    return processed
-
-def combine_predictions(predictions):
-    return ' '.join(predictions)
+def sample_or_pad_frames(frames: list, num_frames: int = NUM_FRAMES):
+    """Функция, которая из набора кадров делает ровно num_frames кадров:
+       - Если кадров меньше num_frames, дублируем последний кадр.
+       - Если кадров больше num_frames, равномерно выбираем num_frames кадров."""
+    length = len(frames)
+    if length < num_frames:
+        last_frame = frames[-1]
+        while len(frames) < num_frames:
+            frames.append(last_frame)
+        return frames
+    elif length > num_frames:
+        indices = np.linspace(0, length - 1, num_frames, dtype=int)
+        frames = [frames[i] for i in indices]
+        return frames
+    else:
+        return frames
 
 @app.post("/predict")
 async def predict(file: UploadFile = File(...)):
     try:
-        # Сохраняем загруженный видеофайл временно
+        # Сохраняем загруженный видеофайл
         temp_video_path = f"/tmp/{file.filename}"
         with open(temp_video_path, "wb") as buffer:
             buffer.write(await file.read())
 
-        # Шаг 1: Извлечение кадров
+        # 1. Извлекаем кадры из видео
         print("Извлечение кадров из видео...")
         frames = extract_frames(temp_video_path)
         print(f"Извлечено {len(frames)} кадров.")
 
-        # Шаг 2: Предобработка кадров
-        print("Предобработка кадров...")
-        preprocessed_frames = []
-        for i, frame in enumerate(frames):
-            preprocessed_frame = preprocess_frame(frame)
-            preprocessed_frames.append(preprocessed_frame)
+        if len(frames) == 0:
+            return JSONResponse(
+                content={"error": "Видео не содержит кадров или не может быть прочитано."},
+                status_code=400
+            )
 
-            # Управление памятью
-            del frame
+        # 2. Предобрабатываем кадры
+        preprocessed_frames = []
+        for frame in frames:
+            preprocessed_frames.append(preprocess_frame(frame))
             gc.collect()
 
-        # Шаг 3: Обработка видео по сегментам и получение предсказаний
-        print("Обработка видео по сегментам и получение предсказаний...")
-        predictions = process_video_segments(preprocessed_frames, model)
+        # 3. Формируем ровно NUM_FRAMES кадров
+        final_frames = sample_or_pad_frames(preprocessed_frames, NUM_FRAMES)
 
-        # Шаг 4: Пост-обработка предсказаний
-        processed_predictions = post_process_predictions(predictions)
-        print("Общий результат предсказаний после пост-обработки:")
-        print(processed_predictions)
+        # 4. Готовим входной тензор для модели: [1, 1, 3, 32, 224, 224]
+        input_tensor = np.stack(final_frames, axis=0)           # shape: [32, 3, 224, 224]
+        input_tensor = np.transpose(input_tensor, (1, 0, 2, 3))   # shape: [3, 32, 224, 224]
+        input_tensor = input_tensor[None, None, ...]              # shape: [1, 1, 3, 32, 224, 224]
+        input_tensor = torch.from_numpy(input_tensor.astype(np.float32)).to(device)
 
-        # Шаг 5: Объединение предсказаний в текст
-        final_text = combine_predictions(processed_predictions)
-        print("Финальный результат:")
-        print(final_text)
+        with torch.no_grad():
+            outputs = model(input_tensor)
+            probabilities = torch.nn.functional.softmax(outputs, dim=1)  
+            probabilities = probabilities.cpu().numpy()[0]  # Получаем массив вероятностей для каждого класса
 
-        # Удаляем временный видеофайл
+        # 5. Сортировка вероятностей и выбор топ-10
+        top_k = 10
+        top_indices = np.argsort(probabilities)[::-1][:top_k]
+        top_predictions = [
+            {"gesture": classes[idx], "probability": float(probabilities[idx])}
+            for idx in top_indices
+        ]
+
+        print("Топ-10 предсказаний:")
+        for pred in top_predictions:
+            print(f"{pred['gesture']}: {pred['probability']:.4f}")
+
+        # Удаляем временный файл
         os.remove(temp_video_path)
 
-        return JSONResponse(content={"predictions": processed_predictions, "final_text": final_text})
+        # 6. Возвращаем результат
+        return JSONResponse(
+            content={"top_predictions": top_predictions}
+        )
 
     except Exception as e:
         return JSONResponse(content={"error": str(e)}, status_code=500)
 
 if __name__ == "__main__":
-    # Запускаем приложение на указанном хосте и порту
     uvicorn.run(app, host="0.0.0.0", port=8000)
